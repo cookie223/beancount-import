@@ -193,7 +193,7 @@ def get_posting_weight(posting: Posting) -> Optional[Amount]:
             return Amount(posting.cost.number * posting.units.number,
                           posting.cost.currency)
         return None
-    elif posting.price is not None and posting.price.number is not MISSING:
+    elif posting.price is not None and posting.price.number is not None and posting.price.number is not MISSING:
         return amount_mul(posting.price, posting.units.number)
     return posting.units
 
@@ -342,7 +342,8 @@ class PostingDatabase(object):
         if postings is None: return dict()
         return {
             k: (t, mp) for (k, (t, mp)) in postings.items()
-            if mp.weight.currency == amount.currency and
+            if mp.weight.currency == amount.currency and mp.weight.number is not None 
+            and mp.weight.number is not MISSING and amount.number is not None and amount.number is not MISSING and
             abs(mp.weight.number - amount.number) <= self.fuzzy_match_amount
         }
 
@@ -467,10 +468,10 @@ def combine_transactions_using_match_set(
         txns: Tuple[Transaction, Transaction], is_cleared: IsClearedFunction,
         match_set: PostingMatchSet) -> Transaction:
     """Combines two transactions.
-
+    
     Metadata is merged (it is assumed that the metadata keys, other than
     ignorable ones, are disjoint).
-
+    
     If a cleared transaction is matched with multiple transactions (guaranteed
     to be uncleared), the result is a single merged transaction.
 
@@ -611,7 +612,7 @@ def normalize_transaction(transaction: Transaction) -> Transaction:
 class SimpleInventory(dict):
     def __iadd__(self, amount: Amount):
         """Adds an amount to the inventory."""
-        if amount is None or amount.number == ZERO:
+        if amount is None or amount.number == ZERO or amount.number is MISSING:
             return self
 
         currency = amount.currency
@@ -699,12 +700,11 @@ def get_aggregate_posting_candidates(
     3. Subsets must not contain cleared postings, or postings with a `cost` or
        `price` specification, or with `MISSING` units.
 
-    4. All postings in a subset must have the same `units.currency`.
-
-    5. Subsets may not sum to zero, or contain any sub-subsets that sum to zero.
+    4. All postings in a subset must have the same `units.currency`, and the
+       same sign of `units.number` (i.e. positive or negative).
 
     6. To limit the computational cost, subsets are limited to at most 4
-       elements, except that all same-sign maximal subsets are also returned.
+       elements, except that all maximal subsets are also returned.
 
     The returned subsets are not, in general, disjoint.
 
@@ -714,42 +714,22 @@ def get_aggregate_posting_candidates(
         the sum of the `units` of each posting in the subset.
     """
     possible_sets = collections.OrderedDict(
-    )  # type: Dict[Tuple[str, str], List[Posting]]
+    )  # type: Dict[Tuple[str, str, bool], List[Posting]]
     for posting in postings:
         if (posting.price is not None or posting.cost is not None or
-                posting.units is None or posting.units is MISSING):
+                posting.units is None or posting.units is MISSING or 
+                posting.units.number is None or posting.units.number is MISSING):
             continue
         if is_cleared(posting):
             continue
-        possible_sets.setdefault((posting.account, posting.units.currency),
+        possible_sets.setdefault((posting.account, posting.units.currency,
+                                  posting.units.number > ZERO),
                                  []).append(posting)
     results = []
     max_subset_size = 4
-    sum_to_zero = set()  # type: Set[Tuple[int, ...]]
 
-    def posting_set_id(postings):
-        return tuple(id(x) for x in postings)
-
-    def partition(predicate, postings):
-        t = []
-        f = []
-        for p in postings:
-            if predicate(p):
-                t.append(p)
-            else:
-                f.append(p)
-        return t, f
-
-    def add_subset(account, currency, subset, check_zero=True):
+    def add_subset(account, currency, subset):
         total = sum(x.units.number for x in subset)
-        if check_zero:
-            if total == ZERO:
-                sum_to_zero.add(posting_set_id(subset))
-                return
-            for subsubset_size in range(2, len(subset)):
-                for subsubset in itertools.combinations(subset, subsubset_size):
-                    if posting_set_id(subsubset) in sum_to_zero:
-                        return
         aggregate_posting = Posting(
             account=account,
             units=Amount(currency=currency, number=total),
@@ -759,13 +739,11 @@ def get_aggregate_posting_candidates(
             meta=None)
         results.append((aggregate_posting, tuple(subset)))
 
-    for (account, currency), posting_list in possible_sets.items():
+    for (account, currency, _), posting_list in possible_sets.items():
         if len(posting_list) == 1:
             continue
         if len(posting_list) > max_subset_size:
-            for samesign_list in partition(lambda p: p.units.number > ZERO, posting_list):
-                if len(samesign_list) > max_subset_size:
-                    add_subset(account, currency, samesign_list, check_zero=False)
+            add_subset(account, currency, posting_list)
         for subset_size in range(
                 2, min(len(posting_list) + 1, max_subset_size + 1)):
             for subset in itertools.combinations(posting_list, subset_size):
@@ -774,7 +752,7 @@ def get_aggregate_posting_candidates(
 
 
 def get_match_group_key(weight: Amount) -> MatchGroupKey:
-    return MatchGroupKey(weight.currency, weight.number > ZERO)
+    return MatchGroupKey(weight.currency, weight.number is not MISSING and weight.number > ZERO)
 
 
 def get_weighted_postings(postings: Sequence[Posting]) -> List[WeightedPosting]:
@@ -845,7 +823,7 @@ def transaction_has_opposite_posting(transaction: Transaction,
     This is used by IsTransactionMergeablePredicate.
     """
     for posting in transaction.postings:
-        if posting.units is not MISSING:
+        if posting.units.number is not MISSING:
             opposite_key = (posting.account, -posting.units, posting.cost,
                             posting.price)
             if opposite_key in posting_specs:
@@ -978,7 +956,7 @@ def compute_single_sign_match_groups(
     """
 
     b_lookup_table = SortedList(
-        (x.weight.number, x) for x in matchable_postings[1])
+        (x.weight.number, x) for x in matchable_postings[1] if x.weight.number is not MISSING)
 
     def get_possible_matches_for_posting_a(a: MatchablePosting):
         weight = a[1]
