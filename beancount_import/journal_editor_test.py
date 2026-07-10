@@ -1,4 +1,5 @@
 import datetime
+import os
 
 import beancount.parser.printer
 from beancount.core.data import Transaction, Posting, EMPTY_SET
@@ -138,6 +139,162 @@ def test_simple(tmpdir):
   Assets:Account-B
 """)
     check_journal_entries(editor)
+
+
+def test_stale_writer_is_rejected_after_another_editor_commits(tmpdir):
+    journal_path = create_journal(
+        tmpdir, """
+2015-02-01 * "Original"
+  Assets:Account-A  100 USD
+  Assets:Account-B
+""")
+    first_editor = journal_editor.JournalEditor(journal_path)
+    second_editor = journal_editor.JournalEditor(journal_path)
+
+    first_stage = first_editor.stage_changes()
+    first_old = first_editor.entries[0]
+    first_stage.change_entry(
+        first_old, first_old._replace(narration='First writer'))
+
+    second_stage = second_editor.stage_changes()
+    second_old = second_editor.entries[0]
+    second_stage.change_entry(
+        second_old, second_old._replace(narration='Second writer'))
+
+    first_stage.apply()
+    with pytest.raises(RuntimeError, match='modified concurrently'):
+        second_stage.apply()
+
+    check_file_contents(
+        journal_path, """
+2015-02-01 * "First writer"
+  Assets:Account-A  100 USD
+  Assets:Account-B
+""")
+
+
+def test_post_write_failure_reports_that_journal_was_applied(
+        tmpdir, monkeypatch):
+    journal_path = create_journal(
+        tmpdir, """
+2015-02-01 * "Original"
+  Assets:Account-A  100 USD
+  Assets:Account-B
+""")
+    editor = journal_editor.JournalEditor(journal_path)
+    stage = editor.stage_changes()
+    old_entry = editor.entries[0]
+    stage.change_entry(old_entry, old_entry._replace(narration='Written'))
+
+    def fail_booking(*args, **kwargs):
+        raise RuntimeError('booking failed after write')
+
+    monkeypatch.setattr(journal_editor.beancount.parser.booking, 'book',
+                        fail_booking)
+    with pytest.raises(journal_editor.JournalWriteAppliedError) as exc_info:
+        stage.apply()
+
+    assert exc_info.value.modified_filenames == [
+        os.path.realpath(journal_path)
+    ]
+    assert exc_info.value.new_entries[0].narration == 'Written'
+    assert isinstance(exc_info.value.cause, RuntimeError)
+    check_file_contents(
+        journal_path, """
+2015-02-01 * "Written"
+  Assets:Account-A  100 USD
+  Assets:Account-B
+""")
+
+
+def test_directory_fsync_failure_after_rename_is_reported_as_applied(
+        tmpdir, monkeypatch):
+    journal_path = create_journal(
+        tmpdir, """
+2015-02-01 * "Original"
+  Assets:Account-A  100 USD
+  Assets:Account-B
+""")
+    editor = journal_editor.JournalEditor(journal_path)
+    stage = editor.stage_changes()
+    old_entry = editor.entries[0]
+    stage.change_entry(old_entry, old_entry._replace(narration='Written'))
+
+    def fail_directory_sync(*args, **kwargs):
+        raise RuntimeError('directory fsync failed after rename')
+
+    monkeypatch.setattr(journal_editor.atomicwrites, '_sync_directory',
+                        fail_directory_sync)
+    with pytest.raises(journal_editor.JournalWriteAppliedError) as exc_info:
+        stage.apply()
+
+    assert exc_info.value.fully_written is True
+    assert exc_info.value.applied_filenames == [
+        os.path.realpath(journal_path)
+    ]
+    assert exc_info.value.intended_filenames == [
+        os.path.realpath(journal_path)
+    ]
+    check_file_contents(
+        journal_path, """
+2015-02-01 * "Written"
+  Assets:Account-A  100 USD
+  Assets:Account-B
+""")
+
+
+def test_multi_file_failure_reports_only_the_files_that_were_applied(
+        tmpdir, monkeypatch):
+    second_path = create_journal(
+        tmpdir, """
+2015-02-02 * "Second original"
+  Assets:Account-A  200 USD
+  Assets:Account-B
+""", name='second.beancount')
+    journal_path = create_journal(
+        tmpdir, """
+include "second.beancount"
+
+2015-02-01 * "First original"
+  Assets:Account-A  100 USD
+  Assets:Account-B
+""")
+    editor = journal_editor.JournalEditor(journal_path)
+    entries = {
+        entry.narration: entry
+        for entry in editor.entries if isinstance(entry, Transaction)
+    }
+    stage = editor.stage_changes()
+    first = entries['First original']
+    second = entries['Second original']
+    stage.change_entry(first, first._replace(narration='First written'))
+    stage.change_entry(second, second._replace(narration='Second written'))
+    original_write = editor._write_file_changes_result
+
+    def fail_second_write(filename, result):
+        if os.path.realpath(filename) == os.path.realpath(second_path):
+            raise RuntimeError('second file failed before write')
+        return original_write(filename, result)
+
+    monkeypatch.setattr(editor, '_write_file_changes_result',
+                        fail_second_write)
+    with pytest.raises(journal_editor.JournalWriteAppliedError) as exc_info:
+        stage.apply()
+
+    assert exc_info.value.fully_written is False
+    assert exc_info.value.applied_filenames == [
+        os.path.realpath(journal_path)
+    ]
+    assert exc_info.value.intended_filenames == [
+        os.path.realpath(journal_path),
+        os.path.realpath(second_path),
+    ]
+    assert [entry.narration for entry in exc_info.value.new_entries] == [
+        'First written'
+    ]
+    assert 'First written' in open(journal_path, encoding='utf-8').read()
+    assert 'Second written' not in open(second_path,
+                                        encoding='utf-8').read()
 
 
 def test_transaction_add_meta(tmpdir):

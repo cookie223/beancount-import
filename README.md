@@ -28,6 +28,11 @@ each other and with existing transactions.
 
 - Easy-to-use, powerful web-based user interface.
 
+- Agent-oriented sequential JSON API with evidence-rich candidates, exact
+  previews, idempotent decisions, read-only inspection, and conservative
+  high-confidence account-classification acceptance.  Legacy fuzzy merges stay
+  agent-reviewed by default.  See [AGENT_API.md](AGENT_API.md).
+
 # Basic operation
 
 From the data source modules, beancount-import obtains a list of *pending*
@@ -148,6 +153,10 @@ To run Beancount-import, create a Python script that invokes the
 `beancount_import.webserver.main` function.  Refer to the examples
 [fresh](examples/fresh/run.py) and
 [manually_entered](examples/manually_entered/run.py).
+
+The same server also exposes an agent reconciliation API.  Its secret URL is
+printed at startup; see [AGENT_API.md](AGENT_API.md) for the protocol and safety
+model.
 
 ## Errors
 

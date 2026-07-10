@@ -27,7 +27,26 @@ from .matching import FIXME_ACCOUNT, is_unknown_account, CLEARED_KEY
 
 display_prediction_explanation = False
 
-classifier_cache_version_number = 1
+classifier_cache_version_number = 2
+
+CLASSIFIER_TRAINING_FINGERPRINT_ATTRIBUTE = (
+    '_beancount_import_training_fingerprint')
+CLASSIFIER_SKLEARN_VERSION_ATTRIBUTE = '_beancount_import_sklearn_version'
+
+
+def get_training_examples_fingerprint(training_examples) -> str:
+    """Returns a deterministic fingerprint for classifier training data."""
+    hasher = hashlib.sha256()
+    for features, label in training_examples:
+        hasher.update(label.encode('utf-8'))
+        hasher.update(b'\0')
+        for key, value in sorted(features.items()):
+            hasher.update(key.encode('utf-8'))
+            hasher.update(b'=')
+            hasher.update(repr(value).encode('utf-8'))
+            hasher.update(b'\0')
+        hasher.update(b'\n')
+    return hasher.hexdigest()
 
 PendingEntry = NamedTuple('PendingEntry', [
     ('date', datetime.date),
@@ -41,7 +60,25 @@ PendingEntry = NamedTuple('PendingEntry', [
 AcceptCandidateResult = NamedTuple('AcceptCandidateResult', [
     ('new_entries', Entries),
     ('modified_filenames', List[str]),
+    ('intended_filenames', List[str]),
+    ('fully_written', bool),
 ])
+
+
+class CandidateWriteAppliedError(RuntimeError):
+    """Raised when a candidate was written but in-memory processing failed."""
+
+    def __init__(self, result: AcceptCandidateResult,
+                 cause: Exception) -> None:
+        super().__init__(
+            'Candidate journal changes were written, but post-processing '
+            'failed: %s' % cause)
+        self.result = result
+        self.cause = cause
+
+
+class ReadOnlyError(RuntimeError):
+    pass
 
 
 def is_account_unknown(posting: Posting) -> bool:
@@ -168,6 +205,27 @@ AccountSubstitution = collections.namedtuple('AccountSubstitution', [
     'predicted_account_name'
 ])
 
+AccountPrediction = NamedTuple('AccountPrediction', [
+    ('account', str),
+    ('probability', float),
+])
+
+AccountPredictionEvidence = NamedTuple('AccountPredictionEvidence', [
+    ('predicted_account', str),
+    ('probability', float),
+    ('runner_up_account', Optional[str]),
+    ('runner_up_probability', float),
+    ('margin', float),
+    ('leaf_sample_count', int),
+    ('recognized_feature_count', int),
+    ('recognized_value_features', List[str]),
+    ('alternatives', List[AccountPrediction]),
+    ('explanation', List[str]),
+    ('input_available', bool),
+    ('model_trusted', bool),
+    ('model_reason', Optional[str]),
+])
+
 
 class Candidate(object):
     def __init__(
@@ -180,6 +238,9 @@ class Candidate(object):
             substituted_accounts: Optional[List[AccountSubstitution]] = None,
             original_transaction_properties: Optional[dict] = None,
             substitute: Optional[Callable[[Dict[str, Any]], 'Candidate']] = None,
+            match_evidence: Optional[matching.MatchEvidence] = None,
+            account_prediction_evidence: Optional[
+                List[AccountPredictionEvidence]] = None,
     ) -> None:
         self.staged_changes = staged_changes
         self.staged_changes_with_unique_account_names = staged_changes_with_unique_account_names
@@ -190,6 +251,9 @@ class Candidate(object):
         self.substituted_accounts = substituted_accounts
 
         self.original_transaction_properties = original_transaction_properties
+
+        self.match_evidence = match_evidence
+        self.account_prediction_evidence = account_prediction_evidence or []
 
         # If not None, Function that when called with list of account names (of same length as substituted_accounts) returns a new candidate.
         self.substitute = substitute
@@ -366,7 +430,11 @@ def make_pending_entry(import_result: ImportResult, source: Optional[Source]):
 class LoadedReconciler(object):
     """Represents the loaded reconciler state."""
 
-    def __init__(self, reconciler, sources=None, classifier=None) -> None:
+    def __init__(self,
+                 reconciler,
+                 sources=None,
+                 classifier=None,
+                 classifier_untrusted_reason: Optional[str] = None) -> None:
         self.reconciler = reconciler
         reconciler.log_status('Loading journal')
         self.editor = journal_editor.JournalEditor(reconciler.journal_path,
@@ -379,11 +447,15 @@ class LoadedReconciler(object):
             # Load sources
             self._load_sources()
 
+        max_matches = reconciler.options.get('max_matches', 0)
+        if max_matches == 0:
+            max_matches = None
         self.posting_db = matching.PostingDatabase(
             fuzzy_match_days=reconciler.options['fuzzy_match_days'],
             fuzzy_match_amount=reconciler.options['fuzzy_match_amount'],
             is_cleared=self.is_posting_cleared,
             metadata_keys=frozenset([matching.CHECK_KEY]),
+            max_matches=max_matches,
         )
 
         # Set of ids of transactions pending import.  Used to determine whether a transaction found
@@ -409,29 +481,84 @@ class LoadedReconciler(object):
         self.training_examples = training.TrainingExamples()
         self._extract_training_examples(self.editor.entries)
 
+        self._refresh_classifier_training_fingerprint()
+        self.classifier_model_trusted = False
+        self.classifier_model_reason = (
+            classifier_untrusted_reason or 'classifier_unavailable')
+
         self.classifier = classifier
-        if self.classifier is None:
+        if self.classifier is not None:
+            import sklearn
+            cached_fingerprint = getattr(
+                self.classifier,
+                CLASSIFIER_TRAINING_FINGERPRINT_ATTRIBUTE,
+                None)
+            cached_sklearn_version = getattr(
+                self.classifier,
+                CLASSIFIER_SKLEARN_VERSION_ATTRIBUTE,
+                None)
+            if classifier_untrusted_reason is not None:
+                pass
+            elif (cached_fingerprint == self.classifier_training_fingerprint and
+                    cached_sklearn_version == sklearn.__version__):
+                self.classifier_model_trusted = True
+                self.classifier_model_reason = None
+            elif self.reconciler.options.get('read_only', False):
+                self.classifier_model_reason = 'classifier_training_data_changed'
+            else:
+                self.classifier = None
+
+        if (self.classifier is None and
+                classifier_untrusted_reason is None):
             classifier_cache_path = self.reconciler.options['classifier_cache']
             if classifier_cache_path is not None and os.path.exists(
                     classifier_cache_path):
                 try:
+                    import sklearn
                     with open(classifier_cache_path, 'rb') as cache_f:
                         cache_data = pickle.load(cache_f)
-                        version = cache_data['version']
-                        if version != classifier_cache_version_number:
-                            raise RuntimeError('invalid version')
+                    version = cache_data.get('version')
+                    cache_fingerprint = cache_data.get(
+                        'training_fingerprint')
+                    if (version == classifier_cache_version_number and
+                            cache_fingerprint ==
+                            self.classifier_training_fingerprint and
+                            cache_data.get('sklearn_version') ==
+                            sklearn.__version__):
                         self.classifier = cache_data['classifier']
+                        self.classifier_model_trusted = True
+                        self.classifier_model_reason = None
+                    elif self.reconciler.options.get('read_only', False):
+                        # A read-only inspection should still be able to use an
+                        # older cache for suggestions, but the confidence policy
+                        # must not auto-accept those predictions.
+                        self.classifier = cache_data['classifier']
+                        self.classifier_model_reason = (
+                            'classifier_cache_not_verified')
+                    else:
+                        self.reconciler.log_status(
+                            'Ignoring classifier cache because it does not '
+                            'match current training data')
                 except:
                     import traceback
                     traceback.print_exc()
                     print('Not using classifier cache due to above error')
 
-        if self.classifier is None:
+        if (self.classifier is None and
+                classifier_untrusted_reason is None):
             self._maybe_train_classifier()
 
     def _extract_training_examples(self, entries: Entries) -> None:
         self._feature_extractor.extract_examples(entries,
                                                  self.training_examples)
+
+    def _refresh_classifier_training_fingerprint(self) -> None:
+        self._classifier_training_examples = [
+            x for x in self.training_examples.training_examples
+            if x[1] != FIXME_ACCOUNT
+        ]
+        self.classifier_training_fingerprint = get_training_examples_fingerprint(
+            self._classifier_training_examples)
 
     def _load_sources(self):
         sources = self.sources = [
@@ -458,32 +585,46 @@ class LoadedReconciler(object):
         return source.is_posting_cleared(posting)
 
     def retrain(self):
+        # Rebuild from the current journal rather than retaining examples from
+        # transactions that may have been replaced or removed by reconciliation.
+        self.training_examples = training.TrainingExamples()
+        self._extract_training_examples(self.editor.entries)
         self._maybe_train_classifier()
         return self
 
     def _maybe_train_classifier(self):
-        training_examples = [
-            x for x in self.training_examples.training_examples
-            if x[1] != FIXME_ACCOUNT
-        ]
+        self._refresh_classifier_training_fingerprint()
+        training_examples = self._classifier_training_examples
         if len(training_examples) > 0:
             self.reconciler.log_status(
                 'Training classifier with %d examples' % len(training_examples))
             import nltk
+            import sklearn
             import sklearn.tree
 
             self.classifier = nltk.classify.scikitlearn.SklearnClassifier(
-                estimator=sklearn.tree.DecisionTreeClassifier())
+                estimator=sklearn.tree.DecisionTreeClassifier(random_state=0))
             self.classifier.train(training_examples)
+            setattr(self.classifier,
+                    CLASSIFIER_TRAINING_FINGERPRINT_ATTRIBUTE,
+                    self.classifier_training_fingerprint)
+            setattr(self.classifier,
+                    CLASSIFIER_SKLEARN_VERSION_ATTRIBUTE,
+                    sklearn.__version__)
+            self.classifier_model_trusted = True
+            self.classifier_model_reason = None
             self.reconciler.log_status(
                 'Trained classifier with %d examples.' % len(training_examples))
             classifier_cache_path = self.reconciler.options['classifier_cache']
-            if classifier_cache_path is None:
+            if (classifier_cache_path is None or
+                    self.reconciler.options.get('read_only', False)):
                 return
             renamed = False
             cache_data = {
                 'version': classifier_cache_version_number,
-                'classifier': self.classifier
+                'classifier': self.classifier,
+                'training_fingerprint': self.classifier_training_fingerprint,
+                'sklearn_version': sklearn.__version__,
             }
             with tempfile.NamedTemporaryFile(
                     mode='wb',
@@ -508,6 +649,10 @@ class LoadedReconciler(object):
             #     if self.classifier.classify(features) != label:
             #         errors += 1
             # print('Classifier accuracy: %.4f', 1 - float(errors) / len(training_examples))
+        else:
+            self.classifier = None
+            self.classifier_model_trusted = False
+            self.classifier_model_reason = 'no_training_examples'
 
     def _prepare_sources(self) -> List[SourceResults]:
         self.reconciler.log_status('Matching source data')
@@ -692,17 +837,112 @@ class LoadedReconciler(object):
     def num_pending(self) -> int:
         return len(self.pending_data)
 
-    def predict_account(
-            self, prediction_input: Optional[training.PredictionInput]) -> str:
+    def predict_account_with_evidence(
+            self, prediction_input: Optional[
+                training.PredictionInput]) -> AccountPredictionEvidence:
+        unavailable = AccountPredictionEvidence(
+            predicted_account=FIXME_ACCOUNT,
+            probability=0.0,
+            runner_up_account=None,
+            runner_up_probability=0.0,
+            margin=0.0,
+            leaf_sample_count=0,
+            recognized_feature_count=0,
+            recognized_value_features=[],
+            alternatives=[],
+            explanation=[],
+            input_available=prediction_input is not None,
+            model_trusted=self.classifier_model_trusted,
+            model_reason=(self.classifier_model_reason
+                          if prediction_input is not None else
+                          'prediction_input_unavailable'),
+        )
         if self.classifier is None or prediction_input is None:
-            return FIXME_ACCOUNT
+            return unavailable
+
         features = training.get_features(prediction_input)
-        explanation = get_prediction_explanation(self.classifier, features)
         predicted_account = self.classifier.classify(features)
+        probability = 0.0
+        alternatives = []  # type: List[AccountPrediction]
+        try:
+            distribution = self.classifier.prob_classify(features)
+            alternatives = sorted(
+                [
+                    AccountPrediction(
+                        account=account,
+                        probability=float(distribution.prob(account)))
+                    for account in distribution.samples()
+                ],
+                key=lambda x: (-x.probability, x.account))
+            probability = next(
+                (x.probability for x in alternatives
+                 if x.account == predicted_account), 0.0)
+        except (AttributeError, NotImplementedError):
+            # Keep the label for display, but an unavailable probability can
+            # never satisfy the automatic acceptance policy.
+            alternatives = [
+                AccountPrediction(account=predicted_account, probability=0.0)
+            ]
+
+        runner_up = next(
+            (x for x in alternatives if x.account != predicted_account), None)
+        runner_up_account = None if runner_up is None else runner_up.account
+        runner_up_probability = (0.0 if runner_up is None else
+                                 runner_up.probability)
+
+        explanation = []
+        leaf_sample_count = 0
+        recognized_feature_count = 0
+        recognized_value_features = []  # type: List[str]
+        try:
+            converted_features = self.classifier._vectorizer.transform(
+                [features])
+            feature_names = self.classifier._vectorizer.get_feature_names_out()
+            recognized_features = [
+                str(feature_names[index])
+                for index in converted_features.nonzero()[1]
+            ]
+            recognized_feature_count = len(recognized_features)
+            recognized_value_features = [
+                feature for feature in recognized_features
+                if ':' in feature and
+                not feature.startswith('account:') and
+                not feature.startswith('amount:')
+            ]
+            classifier = self.classifier._clf
+            if hasattr(classifier, 'apply') and hasattr(classifier, 'tree_'):
+                leaf_id = int(classifier.apply(converted_features)[0])
+                leaf_sample_count = int(
+                    classifier.tree_.n_node_samples[leaf_id])
+                explanation = get_prediction_explanation(
+                    self.classifier, features)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            pass
+
         if display_prediction_explanation:
             print('\n'.join(explanation))
             print('predicted account = %r' % (predicted_account, ))
-        return predicted_account
+
+        return AccountPredictionEvidence(
+            predicted_account=predicted_account,
+            probability=probability,
+            runner_up_account=runner_up_account,
+            runner_up_probability=runner_up_probability,
+            margin=max(0.0, probability - runner_up_probability),
+            leaf_sample_count=leaf_sample_count,
+            recognized_feature_count=recognized_feature_count,
+            recognized_value_features=recognized_value_features,
+            alternatives=alternatives[:5],
+            explanation=explanation,
+            input_available=True,
+            model_trusted=self.classifier_model_trusted,
+            model_reason=self.classifier_model_reason,
+        )
+
+    def predict_account(
+            self, prediction_input: Optional[training.PredictionInput]) -> str:
+        return self.predict_account_with_evidence(
+            prediction_input).predicted_account
 
     def _get_generic_stage(self, entries: Entries):
         stage = self.editor.stage_changes()
@@ -726,12 +966,13 @@ class LoadedReconciler(object):
                 return -source_posting.units.number
         return None
 
-    def _get_unknown_account_predictions(self,
-                                         transaction: Transaction) -> List[str]:
+    def _get_unknown_account_prediction_evidence(
+            self,
+            transaction: Transaction) -> List[AccountPredictionEvidence]:
         group_prediction_inputs = self._feature_extractor.extract_unknown_account_group_features(
             transaction)
         group_predictions = [
-            self.predict_account(prediction_input)
+            self.predict_account_with_evidence(prediction_input)
             for prediction_input in group_prediction_inputs
         ]
         group_numbers = training.get_unknown_account_group_numbers(transaction)
@@ -742,9 +983,16 @@ class LoadedReconciler(object):
     def _make_candidate_with_substitutions(self,
                                            transaction: Transaction,
                                            used_transactions: List[Transaction],
-                                           predicted_accounts: List[str],
+                                           account_prediction_evidence: List[
+                                               AccountPredictionEvidence],
+                                           match_evidence: Optional[
+                                               matching.MatchEvidence] = None,
                                            changes: dict = {}):
         assert isinstance(changes, dict)
+        predicted_accounts = [
+            prediction.predicted_account
+            for prediction in account_prediction_evidence
+        ]
         new_accounts = changes.get('accounts')
         if new_accounts is None:
             new_accounts = predicted_accounts
@@ -777,7 +1025,8 @@ class LoadedReconciler(object):
                 transaction,
                 used_transactions,
                 changes=changes,
-                predicted_accounts=predicted_accounts)
+                account_prediction_evidence=account_prediction_evidence,
+                match_evidence=match_evidence)
 
         new_transaction = _replace_transaction_properties(transaction, changes)
         real_transaction = _get_transaction_with_substitutions(
@@ -820,25 +1069,37 @@ class LoadedReconciler(object):
                 payee=transaction.payee,
                 narration=transaction.narration,
             ),
-            substitute=substitute)
+            substitute=substitute,
+            match_evidence=match_evidence,
+            account_prediction_evidence=account_prediction_evidence)
 
     def _make_candidates_from_import_result(self, next_pending):
         if len(next_pending.entries) == 1 and isinstance(
                 next_pending.entries[0], Transaction):
             next_entry = next_pending.entries[0]
             candidates = []
-            match_results = matching.get_extended_transactions(
+            match_results = matching.get_extended_transactions_with_evidence(
                 next_entry, posting_db=self.posting_db)
             # Always include the original transaction.
-            match_results.append((next_entry, [next_entry]))
-            for transaction, used_transactions in match_results:
-                predicted_accounts = self._get_unknown_account_predictions(
-                    transaction)
+            match_results.append(
+                matching.ScoredMergedTransaction(
+                    transaction=next_entry,
+                    used_transactions=[next_entry],
+                    match_evidence=matching.MatchEvidence(
+                        cleared_posting_matches=0,
+                        uncleared_posting_matches=0,
+                        unknown_postings_removed=0,
+                        search_truncated=match_results.search_truncated)))
+            for match_result in match_results:
+                account_prediction_evidence = self._get_unknown_account_prediction_evidence(
+                    match_result.transaction)
                 candidates.append(
                     self._make_candidate_with_substitutions(
-                        transaction,
-                        used_transactions,
-                        predicted_accounts=predicted_accounts))
+                        match_result.transaction,
+                        match_result.used_transactions,
+                        account_prediction_evidence=
+                        account_prediction_evidence,
+                        match_evidence=match_result.match_evidence))
             result = Candidates(
                 candidates=candidates,
                 date=next_entry.date,
@@ -888,52 +1149,79 @@ class LoadedReconciler(object):
         return skip_ids
 
     def accept_candidate(self, candidate: Candidate, ignore=False) -> AcceptCandidateResult:
+        if self.reconciler.options.get('read_only', False):
+            raise ReadOnlyError(
+                'Cannot accept or ignore candidates in read-only mode.')
         ignored_path = self.editor.ignored_path
-        if ignored_path is None:
+        if ignore and ignored_path is None:
             raise RuntimeError(
                 'Cannot ignore candidate without an "ignored" journal having been specified.'
             )
         staged_changes = candidate.staged_changes
         if ignore:
+            assert ignored_path is not None
             staged_changes = staged_changes.make_with_new_output_filename(
                 ignored_path)
-        result = staged_changes.apply()
+        modified_filenames = staged_changes.get_modified_filenames()
+        try:
+            result = staged_changes.apply()
+        except journal_editor.JournalWriteAppliedError as e:
+            raise CandidateWriteAppliedError(
+                AcceptCandidateResult(
+                    new_entries=e.new_entries,
+                    modified_filenames=e.applied_filenames,
+                    intended_filenames=e.intended_filenames,
+                    fully_written=e.fully_written),
+                e.cause) from e
+        accept_result = AcceptCandidateResult(
+            new_entries=result.new_entries + result.new_ignored_entries,
+            modified_filenames=modified_filenames,
+            intended_filenames=modified_filenames,
+            fully_written=True,
+        )
         old_entries = result.old_entries
         new_entries = result.new_entries
+        try:
+            for entry in old_entries:
+                if isinstance(entry, Transaction):
+                    self.posting_db.remove_transaction(entry)
 
-        for entry in old_entries:
-            if isinstance(entry, Transaction):
-                self.posting_db.remove_transaction(entry)
+            old_entry_ids = set(id(x) for x in old_entries)
+            self.uncleared_postings = [
+                x for x in self.uncleared_postings
+                if id(x[0]) not in old_entry_ids
+            ]
+            for import_result in candidate.used_import_results:
+                if isinstance(import_result, Transaction):
+                    if id(import_result) in self.pending_transaction_ids:
+                        self.pending_transaction_ids.remove(id(import_result))
+                        self.posting_db.remove_transaction(import_result)
 
-        old_entry_ids = set(id(x) for x in old_entries)
-        self.uncleared_postings = [
-            x for x in self.uncleared_postings if id(x[0]) not in old_entry_ids
-        ]
-        for import_result in candidate.used_import_results:
-            if isinstance(import_result, Transaction):
-                if id(import_result) in self.pending_transaction_ids:
-                    self.pending_transaction_ids.remove(id(import_result))
-                    self.posting_db.remove_transaction(import_result)
+            self._add_uncleared_postings_from(new_entries)
+            self.uncleared_postings.sort(key=lambda x: x[0].date)
+            for entry in new_entries:
+                if isinstance(entry, Transaction):
+                    self.posting_db.add_transaction(entry)
 
-        self._add_uncleared_postings_from(new_entries)
-        self.uncleared_postings.sort(key=lambda x: x[0].date)
-        for entry in new_entries:
-            if isinstance(entry, Transaction):
-                self.posting_db.add_transaction(entry)
+            if self.classifier is not None:
+                # Any journal change can add, replace, or remove classifier
+                # examples.  The existing model remains useful as a suggestion,
+                # but explicit retraining must rebuild examples from the current
+                # editor before its confidence can be trusted again.
+                self.classifier_model_trusted = False
+                self.classifier_model_reason = (
+                    'classifier_not_retrained_after_journal_change')
 
-        self._extract_training_examples(new_entries)
-
-        used_import_result_ids = frozenset(
-            map(id, candidate.used_import_results))
-        self.pending_data = [
-            e for e in self.pending_data
-            if id(e) not in used_import_result_ids and
-            id(e.entries[0]) not in used_import_result_ids
-        ]
-        return AcceptCandidateResult(
-            new_entries=new_entries + result.new_ignored_entries,
-            modified_filenames=staged_changes.get_modified_filenames(),
-        )
+            used_import_result_ids = frozenset(
+                map(id, candidate.used_import_results))
+            self.pending_data = [
+                e for e in self.pending_data
+                if id(e) not in used_import_result_ids and
+                id(e.entries[0]) not in used_import_result_ids
+            ]
+        except Exception as e:
+            raise CandidateWriteAppliedError(accept_result, e) from e
+        return accept_result
 
 
 class Reconciler(object):
@@ -949,7 +1237,9 @@ class Reconciler(object):
         self.loaded_future = call_in_new_thread(
             LoadedReconciler, reconciler=self, classifier=None)
 
-    def reload_journal(self):
+    def reload_journal(
+            self,
+            classifier_untrusted_reason: Optional[str] = None):
         assert self.loaded_future.done()
         loaded_reconciler = self.loaded_future.result()
         classifier = loaded_reconciler.classifier
@@ -958,7 +1248,8 @@ class Reconciler(object):
             LoadedReconciler,
             reconciler=self,
             classifier=classifier,
-            sources=existing_sources)
+            sources=existing_sources,
+            classifier_untrusted_reason=classifier_untrusted_reason)
 
     def retrain(self):
         assert self.loaded_future.done()

@@ -23,11 +23,18 @@ from typing import Union, Dict, Tuple, List, Optional, Set, NamedTuple, Sequence
 import datetime
 import collections
 import contextlib
+import hashlib
 import io
 import os
 import re
+import tempfile
 import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback is process-local.
+    fcntl = None
 
 import atomicwrites
 from beancount.core.data import Open, Transaction, Balance, Commodity, Entries, Directive, Meta, Posting
@@ -46,6 +53,46 @@ LineRange = Tuple[int, int]
 LineChangeType = int
 
 line_change_indicators = {-1: '-', 0: ' ', 1: '+'}
+
+_journal_write_thread_lock = threading.Lock()
+
+
+def _file_signature_from_stat(stat_result):
+    return (stat_result.st_mtime_ns, stat_result.st_size,
+            getattr(stat_result, 'st_ino', None))
+
+
+def _get_file_signature(filename: str):
+    try:
+        return _file_signature_from_stat(os.stat(filename))
+    except FileNotFoundError:
+        return None
+
+
+@contextlib.contextmanager
+def _acquire_journal_write_locks(filenames: Sequence[str]):
+    """Serializes writes to the same journal files across local processes."""
+    lock_files = []
+    with _journal_write_thread_lock:
+        try:
+            if fcntl is not None:
+                lock_directory = os.path.join(
+                    tempfile.gettempdir(), 'beancount-import-locks')
+                os.makedirs(lock_directory, exist_ok=True)
+                for filename in sorted(set(os.path.realpath(x)
+                                           for x in filenames)):
+                    lock_name = hashlib.sha256(
+                        filename.encode('utf-8')).hexdigest() + '.lock'
+                    lock_file = open(
+                        os.path.join(lock_directory, lock_name), 'a+b')
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                    lock_files.append(lock_file)
+            yield
+        finally:
+            for lock_file in reversed(lock_files):
+                assert fcntl is not None
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
 
 LineChange = Tuple[LineChangeType, str]
 
@@ -78,6 +125,35 @@ ApplyStagedChangesResult = NamedTuple('ApplyStagedChangesResult', [
     ('old_ignored_entries', Entries),
     ('new_ignored_entries', Entries),
 ])
+
+
+class FileWriteAppliedError(RuntimeError):
+    """Raised when an atomic replacement succeeded but its follow-up failed."""
+
+    def __init__(self, filename: str, cause: Exception) -> None:
+        super().__init__(
+            'Journal file was replaced, but write finalization failed: %s' %
+            cause)
+        self.filename = filename
+        self.cause = cause
+
+
+class JournalWriteAppliedError(RuntimeError):
+    """Raised when one or more journal files changed before a later failure."""
+
+    def __init__(self, applied_filenames: List[str],
+                 intended_filenames: List[str], new_entries: Entries,
+                 cause: Exception) -> None:
+        self.applied_filenames = applied_filenames
+        # Backward-compatible alias used by callers that notify file watchers.
+        self.modified_filenames = applied_filenames
+        self.intended_filenames = intended_filenames
+        self.fully_written = (applied_filenames == intended_filenames)
+        self.new_entries = new_entries
+        self.cause = cause
+        status = 'all journal files were written' if self.fully_written else (
+            'only some journal files were written')
+        super().__init__('%s before a later failure: %s' % (status, cause))
 
 
 def get_accounts_and_commodities(
@@ -291,6 +367,10 @@ class JournalEditor(object):
         self.journal_filenames = set(os.path.realpath(x) for x in journal_paths)
         self.ignored_journal_filenames = set(
             os.path.realpath(x) for x in ignored_journal_paths)
+        self.journal_load_signature = {
+            filename: _get_file_signature(filename)
+            for filename in self.journal_filenames
+        }
         self._all_entries = None  # type: Optional[Entries]
 
     @property
@@ -304,6 +384,8 @@ class JournalEditor(object):
         filename = os.path.realpath(filename)
         if filename in self.cached_lines:
             return (filename, self.cached_lines[filename])
+        self.journal_load_signature.setdefault(
+            filename, _get_file_signature(filename))
         lines = _get_journal_contents(filename).split('\n')
         self.cached_lines[filename] = lines
         return filename, lines
@@ -332,10 +414,9 @@ class JournalEditor(object):
         return filename, lines, (start_line, start_line)
 
     def check_journal_modification(self, filename: str):
-        mtime = os.stat(filename).st_mtime
-        check_mtime = self.journal_load_time.get(filename,
-                                                 self.default_journal_load_time)
-        return (mtime > check_mtime)
+        filename = os.path.realpath(filename)
+        return (_get_file_signature(filename) !=
+                self.journal_load_signature.get(filename))
 
     def check_any_journal_modification(self):
         modified_filenames = set()
@@ -403,11 +484,10 @@ class JournalEditor(object):
             append_only=append_only,
         )
 
-    def apply_file_changes_result(self, filename: str,
-                                  result: ApplyFileChangesResult):
+    def _write_file_changes_result(self, filename: str,
+                                   result: ApplyFileChangesResult):
         new_lines = result.new_lines
         new_data = result.new_contents
-        lineno_map = result.lineno_map
         filename = os.path.realpath(filename)
         if self.check_journal_modification(filename):
             raise RuntimeError(
@@ -415,8 +495,21 @@ class JournalEditor(object):
 
         writer = _AtomicWriter(
             filename, mode='w+', encoding='utf-8', newline='\n', overwrite=True)
-        with writer.open() as f:
-            f.write(new_data)
+        try:
+            with writer.open() as f:
+                f.write(new_data)
+        except Exception as e:
+            # atomicwrites renames the temporary file before syncing the parent
+            # directory.  If that final fsync fails, the target already contains
+            # the committed bytes and must not be reported as a pre-write error.
+            try:
+                with open(filename, 'rb') as f:
+                    target_matches = f.read() == new_data.encode('utf-8')
+            except OSError:
+                target_matches = False
+            if target_matches:
+                raise FileWriteAppliedError(filename, e) from e
+            raise
         # On MS Windows, closing a file that has just been written causes the
         # modification time to change.  Therefore, we must close the file before
         # checking the modification time in order to get a modification time
@@ -426,8 +519,16 @@ class JournalEditor(object):
         # may obtain a modification time that reflects additional modifications.
         # The _AtomicWriter wrapper takes care of checking the modification time
         # after closing the file but before renaming it.
-        mtime = writer.stat_result_after_close.st_mtime
-        self.journal_load_time[filename] = mtime
+        stat_result = writer.stat_result_after_close
+        return filename, stat_result
+
+    def _postprocess_file_changes_result(self, filename: str,
+                                         result: ApplyFileChangesResult,
+                                         stat_result) -> None:
+        new_lines = result.new_lines
+        lineno_map = result.lineno_map
+        self.journal_load_time[filename] = stat_result.st_mtime
+        self.journal_load_signature[filename] = _get_file_signature(filename)
         self.cached_lines[filename] = new_lines
 
         realpaths = dict()  # type: Dict[str, str]
@@ -461,6 +562,12 @@ class JournalEditor(object):
                     for posting in entry.postings:
                         fix_meta(posting.meta)
 
+    def apply_file_changes_result(self, filename: str,
+                                  result: ApplyFileChangesResult):
+        filename, stat_result = self._write_file_changes_result(
+            filename, result)
+        self._postprocess_file_changes_result(filename, result, stat_result)
+
     def get_file_change_results(self, change_sets: List[FileChangeSet]
                                 ) -> Dict[str, ApplyFileChangesResult]:
         return {
@@ -474,56 +581,106 @@ class JournalEditor(object):
         for filename, result in results.items():
             self.apply_file_changes_result(filename, result)
 
-    def apply_change_sets(self, change_sets: List[FileChangeSet]):
-        results = self.get_file_change_results(change_sets)
-        self.apply_file_change_results(results)
+    def apply_change_sets(self, change_sets: List[FileChangeSet],
+                          new_entries: Entries):
+        intended_filenames = [
+            os.path.realpath(change_set.filename)
+            for change_set in change_sets
+        ]
+        with _acquire_journal_write_locks(intended_filenames):
+            results = self.get_file_change_results(change_sets)
+            applied_filenames = []  # type: List[str]
+            try:
+                for filename, result in results.items():
+                    try:
+                        filename, stat_result = self._write_file_changes_result(
+                            filename, result)
+                    except FileWriteAppliedError as e:
+                        applied_filenames.append(e.filename)
+                        raise JournalWriteAppliedError(
+                            applied_filenames,
+                            intended_filenames,
+                            self._get_new_entries_for_filenames(
+                                new_entries, applied_filenames),
+                            e.cause) from e
+                    applied_filenames.append(filename)
+                    self._postprocess_file_changes_result(
+                        filename, result, stat_result)
+            except JournalWriteAppliedError:
+                raise
+            except Exception as e:
+                if applied_filenames:
+                    raise JournalWriteAppliedError(
+                        applied_filenames,
+                        intended_filenames,
+                        self._get_new_entries_for_filenames(
+                            new_entries, applied_filenames),
+                        e) from e
+                raise
+
+    @staticmethod
+    def _get_new_entries_for_filenames(
+            new_entries: Entries, filenames: Sequence[str]) -> Entries:
+        filename_set = set(filenames)
+        return [
+            entry for entry in new_entries
+            if entry.meta is not None and os.path.realpath(
+                entry.meta.get('filename', '')) in filename_set
+        ]
 
     def apply_staged_changes(
             self, staged_changes: 'StagedChanges') -> ApplyStagedChangesResult:
         change_sets, old_entries, new_entries = staged_changes.get_diff()
-        self.apply_change_sets(change_sets)
-        old_entries_set = set(map(id, old_entries))
-        self.entries = [
-            e for e in self.entries
-            if id(e) not in old_entries_set and e.meta.get('lineno') is not None
-        ]
-        self.ignored_entries = [
-            e for e in self.ignored_entries
-            if id(e) not in old_entries_set and e.meta.get('lineno') is not None
-        ]
-        booked_new_entries, balance_errors = beancount.parser.booking.book(
-            new_entries, self.options_map)
-        non_ignored_booked_new_entries = []  # type: Entries
-        ignored_booked_new_entries = []  # type: Entries
-        for entry in booked_new_entries:
-            if os.path.realpath(entry.meta.get(
-                    'filename')) in self.ignored_journal_filenames:
-                self.ignored_entries.append(entry)
-                ignored_booked_new_entries.append(entry)
-            else:
-                self.entries.append(entry)
-                non_ignored_booked_new_entries.append(entry)
-                if isinstance(entry, Open):
-                    self.accounts[entry.account] = entry
-                if isinstance(entry, Commodity):
-                    self.commodities[entry.currency] = entry
+        modified_filenames = [x.filename for x in change_sets]
+        self.apply_change_sets(change_sets, new_entries)
+        try:
+            old_entries_set = set(map(id, old_entries))
+            self.entries = [
+                e for e in self.entries if id(e) not in old_entries_set and
+                e.meta.get('lineno') is not None
+            ]
+            self.ignored_entries = [
+                e for e in self.ignored_entries
+                if id(e) not in old_entries_set and
+                e.meta.get('lineno') is not None
+            ]
+            booked_new_entries, balance_errors = beancount.parser.booking.book(
+                new_entries, self.options_map)
+            non_ignored_booked_new_entries = []  # type: Entries
+            ignored_booked_new_entries = []  # type: Entries
+            for entry in booked_new_entries:
+                if os.path.realpath(entry.meta.get(
+                        'filename')) in self.ignored_journal_filenames:
+                    self.ignored_entries.append(entry)
+                    ignored_booked_new_entries.append(entry)
+                else:
+                    self.entries.append(entry)
+                    non_ignored_booked_new_entries.append(entry)
+                    if isinstance(entry, Open):
+                        self.accounts[entry.account] = entry
+                    if isinstance(entry, Commodity):
+                        self.commodities[entry.currency] = entry
 
-        self.entries.sort(key=beancount.core.data.entry_sortkey)
-        self.ignored_entries.sort(key=beancount.core.data.entry_sortkey)
-        self._all_entries = None
-        return ApplyStagedChangesResult(
-            old_entries=[
-                e for e in old_entries
-                if os.path.realpath(e.meta.get('filename')) not in self.
-                ignored_journal_filenames
-            ],
-            new_entries=non_ignored_booked_new_entries,
-            old_ignored_entries=[
-                e for e in old_entries if os.path.realpath(
-                    e.meta.get('filename')) in self.ignored_journal_filenames
-            ],
-            new_ignored_entries=ignored_booked_new_entries,
-        )
+            self.entries.sort(key=beancount.core.data.entry_sortkey)
+            self.ignored_entries.sort(key=beancount.core.data.entry_sortkey)
+            self._all_entries = None
+            return ApplyStagedChangesResult(
+                old_entries=[
+                    e for e in old_entries
+                    if os.path.realpath(e.meta.get('filename')) not in self.
+                    ignored_journal_filenames
+                ],
+                new_entries=non_ignored_booked_new_entries,
+                old_ignored_entries=[
+                    e for e in old_entries if os.path.realpath(
+                        e.meta.get('filename')) in self.
+                    ignored_journal_filenames
+                ],
+                new_ignored_entries=ignored_booked_new_entries,
+            )
+        except Exception as e:
+            raise JournalWriteAppliedError(
+                modified_filenames, modified_filenames, new_entries, e) from e
 
     def stage_changes(self) -> 'StagedChanges':
         return StagedChanges(self)

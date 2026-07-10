@@ -8,6 +8,7 @@ import pytest
 
 MODULES = [
     "beancount_import",
+    "beancount_import.agent",
     "beancount_import.amount_parsing",
     "beancount_import.delete_transactions",
     "beancount_import.journal_editor",

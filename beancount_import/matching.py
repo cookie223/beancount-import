@@ -243,10 +243,14 @@ class PostingDatabase(object):
     def __init__(self, fuzzy_match_days: int,
                  fuzzy_match_amount: Decimal,
                  is_cleared: IsClearedFunction,
-                 metadata_keys=frozenset()) -> None:
+                 metadata_keys=frozenset(),
+                 max_matches: Optional[int] = None) -> None:
         self.fuzzy_match_days = fuzzy_match_days
         self.fuzzy_match_amount = fuzzy_match_amount
         self.is_cleared = is_cleared
+        if max_matches is not None and max_matches < 1:
+            raise ValueError('max_matches must be positive or None')
+        self.max_matches = max_matches
         self._date_currency = collections.defaultdict(list) # type: Dict[DateCurrencyKey, List[SearchPosting]]
         self._date_currency_dirty = collections.defaultdict(bool) # type: Dict[DateCurrencyKey, bool]
         self._keyed_postings = {
@@ -1589,6 +1593,31 @@ MergedTransaction = NamedTuple('MergedTransaction',
                                [('transaction', Transaction),
                                 ('used_transactions', List[Transaction])])
 
+class MatchEvidence(NamedTuple):
+    cleared_posting_matches: int
+    uncleared_posting_matches: int
+    unknown_postings_removed: int
+    search_truncated: bool = False
+
+
+class MatchSearchTracker(object):
+    def __init__(self) -> None:
+        self.truncated = False
+
+ScoredMergedTransaction = NamedTuple(
+    'ScoredMergedTransaction',
+    [('transaction', Transaction),
+     ('used_transactions', List[Transaction]),
+     ('match_evidence', MatchEvidence)])
+
+
+class ScoredMergedTransactions(list):
+    """List of merge results with candidate-set-level search completeness."""
+
+    def __init__(self, values, search_truncated: bool) -> None:
+        super().__init__(values)
+        self.search_truncated = search_truncated
+
 SingleStepMergedTransaction = NamedTuple('SingleStepMergedTransaction',
                                          [('transaction', Transaction),
                                           ('matched_transaction', Transaction)])
@@ -1637,7 +1666,9 @@ def get_single_step_extended_transactions(
         transaction: Transaction,
         posting_db: PostingDatabase,
         excluded_transaction_ids: FrozenSet[int],
-        debug_level=0) -> Iterable[SingleStepMergedTransaction]:
+        debug_level=0,
+        search_tracker: Optional[
+            MatchSearchTracker] = None) -> Iterable[SingleStepMergedTransaction]:
     """Finds valid merges of `transaction` with a single additional transaction.
 
     This is done by first computing the set of `matchable_postings` by calling
@@ -1683,7 +1714,14 @@ def get_single_step_extended_transactions(
         results = posting_db.search_postings(
             transaction, matchable_postings, cmp_callable=_postings_match)
         for sp in results:
-            matching_transactions[id(sp.entry)] = sp.entry
+            entry_id = id(sp.entry)
+            if (entry_id not in matching_transactions and
+                    posting_db.max_matches is not None and
+                    len(matching_transactions) >= posting_db.max_matches):
+                if search_tracker is not None:
+                    search_tracker.truncated = True
+                break
+            matching_transactions[entry_id] = sp.entry
     else:
         for mp in matchable_postings:
             for orig_matching_transaction, _ in _get_valid_posting_matches(
@@ -1693,7 +1731,18 @@ def get_single_step_extended_transactions(
                     posting_db=posting_db,
                     excluded_transaction_ids=excluded_transaction_ids,
             ):
-                matching_transactions[id(orig_matching_transaction)] = orig_matching_transaction
+                entry_id = id(orig_matching_transaction)
+                if (entry_id not in matching_transactions and
+                        posting_db.max_matches is not None and
+                        len(matching_transactions) >=
+                        posting_db.max_matches):
+                    if search_tracker is not None:
+                        search_tracker.truncated = True
+                    break
+                matching_transactions[
+                    entry_id] = orig_matching_transaction
+            if (search_tracker is not None and search_tracker.truncated):
+                break
 
 
     postings_matched = set()  # type: Set[int]
@@ -1706,6 +1755,7 @@ def get_single_step_extended_transactions(
         debug_print(
             'Matching transactions: (%d)' % (len(matching_transactions), ),
             level=debug_level)
+    yielded = 0
     for matching_transaction in matching_transactions.values():
         if DEBUG:
             debug_print(
@@ -1720,7 +1770,13 @@ def get_single_step_extended_transactions(
                 level=debug_level)
         postings_matched.update(new_postings_matched)
         for new_transaction in combined_transactions:
+            if (posting_db.max_matches is not None and
+                    yielded >= posting_db.max_matches):
+                if search_tracker is not None:
+                    search_tracker.truncated = True
+                return
             yield SingleStepMergedTransaction(new_transaction, matching_transaction)
+            yielded += 1
 
     for mp in matchable_postings:
         # Only search for a match between an unknown account posting and another
@@ -1728,16 +1784,23 @@ def get_single_step_extended_transactions(
         # match the non-negated amount.
         if id(mp.posting) in postings_matched: continue
         if not is_removal_candidate(mp): continue
-        yield from get_unknown_to_opposite_unknown_extensions(
-            transaction_constraint=transaction_constraint,
-            posting_db=posting_db,
-            excluded_transaction_ids=excluded_transaction_ids,
-            mp=mp)
+        for extension in get_unknown_to_opposite_unknown_extensions(
+                transaction_constraint=transaction_constraint,
+                posting_db=posting_db,
+                excluded_transaction_ids=excluded_transaction_ids,
+                mp=mp):
+            if (posting_db.max_matches is not None and
+                    yielded >= posting_db.max_matches):
+                if search_tracker is not None:
+                    search_tracker.truncated = True
+                return
+            yield extension
+            yielded += 1
 
 
-def get_extended_transactions(
+def get_extended_transactions_with_evidence(
         initial_transaction: Transaction,
-        posting_db: PostingDatabase) -> List[MergedTransaction]:
+        posting_db: PostingDatabase) -> ScoredMergedTransactions:
     """Finds valid merges of `initial_transaction`.
 
     Performs a depth-first search over the space of merged transactions.  The
@@ -1745,18 +1808,23 @@ def get_extended_transactions(
     the existing merged transaction, are obtained by calling
     `get_single_step_extended_transactions`.
 
-    :returns: The list of merged transactions, ordered by
-        `merged_transaction_sort_key`.
+    :returns: The list of merged transactions and the structural evidence used
+        to rank them, ordered by `merged_transaction_sort_key`.
     """
     used_transaction_ids = set()  # type: Set[int]
     used_transactions = []  # type: List[Transaction]
 
     results = [] # type: List[Tuple[Transaction, List[Transaction]]]
+    search_tracker = MatchSearchTracker()
 
     previously_seen_states = set()  # type: Set[CandidateIdentifier]
 
     def maybe_extend_candidate(transaction: Transaction,
                                ref_transaction: Transaction, level: int):
+        if (posting_db.max_matches is not None and
+                len(results) >= posting_db.max_matches):
+            search_tracker.truncated = True
+            return
         # Check if we have already seen this state.
         if ref_transaction is not None:
             used_transaction_ids.add(id(ref_transaction))
@@ -1783,14 +1851,39 @@ def get_extended_transactions(
                 posting_db=posting_db,
                 excluded_transaction_ids=cast(FrozenSet[int],
                                               used_transaction_ids),
-                debug_level=level):
+                debug_level=level,
+                search_tracker=search_tracker):
             maybe_extend_candidate(new_transaction, matching_transaction,
                                    level + 1)
 
     maybe_extend_candidate(initial_transaction, initial_transaction, level=0)
 
     results.sort(key=lambda x: merged_transaction_sort_key(x[0]))
-    return [
-        MergedTransaction(normalize_transaction(entry), used_transactions)
+    scored_results = [
+        ScoredMergedTransaction(
+            transaction=normalize_transaction(entry),
+            used_transactions=used_transactions,
+            match_evidence=MatchEvidence(
+                cleared_posting_matches=get_count(
+                    entry, NUM_CLEARED_POSTING_MATCHES_KEY),
+                uncleared_posting_matches=get_count(
+                    entry, NUM_UNCLEARED_POSTING_MATCHES_KEY),
+                unknown_postings_removed=get_count(
+                    entry, NUM_UNKNOWN_POSTINGS_REMOVED_KEY),
+                search_truncated=search_tracker.truncated,
+            ))
         for entry, used_transactions in results
+    ]
+    return ScoredMergedTransactions(
+        scored_results, search_truncated=search_tracker.truncated)
+
+
+def get_extended_transactions(
+        initial_transaction: Transaction,
+        posting_db: PostingDatabase) -> List[MergedTransaction]:
+    """Finds valid merges while preserving the original public return type."""
+    return [
+        MergedTransaction(result.transaction, result.used_transactions)
+        for result in get_extended_transactions_with_evidence(
+            initial_transaction, posting_db)
     ]

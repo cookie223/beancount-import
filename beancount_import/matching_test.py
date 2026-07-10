@@ -79,6 +79,125 @@ def assert_file_match(name):
         })
 
 
+def test_get_extended_transactions_with_evidence_matches_legacy_api():
+    candidate_entry, other_entry = test_util.parse("""
+        2016-01-01 * "Candidate"
+          Assets:A  -1 USD
+            cleared: TRUE
+          Assets:B   1 USD
+
+        2016-01-01 * "Other"
+          Assets:A  -1 USD
+          Assets:B   1 USD
+            cleared: TRUE
+        """)
+    del candidate_entry.meta['filename']
+    del other_entry.meta['filename']
+
+    def is_cleared(posting):
+        return posting.meta and posting.meta.get('cleared') == True
+
+    posting_db = matching.PostingDatabase(
+        fuzzy_match_days=3,
+        fuzzy_match_amount=decimal.Decimal("0.01"),
+        is_cleared=is_cleared,
+        metadata_keys=frozenset([matching.CHECK_KEY]),
+    )
+    add_entries_to_db(posting_db, [candidate_entry, other_entry])
+
+    scored_results = matching.get_extended_transactions_with_evidence(
+        candidate_entry, posting_db)
+    legacy_results = matching.get_extended_transactions(candidate_entry,
+                                                        posting_db)
+
+    assert [
+        matching.MergedTransaction(result.transaction,
+                                   result.used_transactions)
+        for result in scored_results
+    ] == legacy_results
+    assert scored_results
+    assert any(sum(result.match_evidence) > 0 for result in scored_results)
+    for result in scored_results:
+        transaction_meta = result.transaction.meta or {}
+        assert set(matching.TRANSACTION_TEMP_METADATA_KEYS).isdisjoint(
+            transaction_meta)
+
+
+def test_match_evidence_marks_a_limited_search_as_truncated():
+    candidate_entry, other_entry_1, other_entry_2 = test_util.parse("""
+        2016-01-01 * "Candidate"
+          Assets:A  -1 USD
+            cleared: TRUE
+            candidate_note: "A"
+          Assets:B   1 USD
+            candidate_note: "B"
+
+        2016-01-01 * "Other one"
+          Assets:A  -1 USD
+            first_note: "A"
+          Assets:B   1 USD
+            cleared: TRUE
+            first_note: "B"
+
+        2016-01-01 * "Other two"
+          Assets:A  -1 USD
+            second_note: "A"
+          Assets:B   1 USD
+            cleared: TRUE
+            second_note: "B"
+        """)
+    entries = [candidate_entry, other_entry_1, other_entry_2]
+    for entry in entries:
+        del entry.meta['filename']
+
+    def is_cleared(posting):
+        return posting.meta and posting.meta.get('cleared') == True
+
+    posting_db = matching.PostingDatabase(
+        fuzzy_match_days=3,
+        fuzzy_match_amount=decimal.Decimal("0.01"),
+        is_cleared=is_cleared,
+        metadata_keys=frozenset([matching.CHECK_KEY]),
+        max_matches=1,
+    )
+    add_entries_to_db(posting_db, entries)
+
+    results = matching.get_extended_transactions_with_evidence(
+        candidate_entry, posting_db)
+
+    assert results
+    assert results.search_truncated is True
+    assert all(result.match_evidence.search_truncated for result in results)
+
+
+def test_truncation_is_retained_when_no_merged_result_is_returned(monkeypatch):
+    candidate_entry, = test_util.parse("""
+        2016-01-01 * "Candidate"
+          Assets:A  -1 USD
+          Assets:B   1 USD
+        """)
+    del candidate_entry.meta['filename']
+    posting_db = matching.PostingDatabase(
+        fuzzy_match_days=3,
+        fuzzy_match_amount=decimal.Decimal('0.01'),
+        is_cleared=lambda posting: False,
+        max_matches=1,
+    )
+    posting_db.add_transaction(candidate_entry)
+
+    def truncated_without_results(*args, **kwargs):
+        kwargs['search_tracker'].truncated = True
+        return iter(())
+
+    monkeypatch.setattr(matching, 'get_single_step_extended_transactions',
+                        truncated_without_results)
+    results = matching.get_extended_transactions_with_evidence(
+        candidate_entry, posting_db)
+
+    assert results == []
+    assert results.search_truncated is True
+
+
 def test_cleared_matches_not_cleared():
     # This case corresponds to a transfer between two bank accounts: the transactions created
     # from each bank statement are duplicates and should be matched.
